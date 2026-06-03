@@ -26,12 +26,23 @@ enum GatewaySettingsStore {
     private static let preferredGatewayStableIDAccount = "preferredStableID"
     private static let lastDiscoveredGatewayStableIDAccount = "lastDiscoveredStableID"
     private static let lastGatewayConnectionAccount = "lastConnection"
-    private static let talkProviderApiKeyAccountPrefix = "provider.apiKey."
+    private static let talkProviderApiKeyAccountPrefix = "provider.apiKey." // pragma: allowlist secret
 
     static func bootstrapPersistence() {
         self.ensureStableInstanceID()
         self.ensurePreferredGatewayStableID()
         self.ensureLastDiscoveredGatewayStableID()
+    }
+
+    static func currentInstanceID(defaults: UserDefaults = .standard) -> String {
+        self.bootstrapPersistence()
+        if let value = defaults.string(forKey: self.instanceIdDefaultsKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !value.isEmpty
+        {
+            return value
+        }
+        return self.loadStableInstanceID() ?? ""
     }
 
     static func loadStableInstanceID() -> String? {
@@ -52,8 +63,7 @@ enum GatewaySettingsStore {
     static func loadPreferredGatewayStableID() -> String? {
         if let value = KeychainStore.loadString(
             service: self.gatewayService,
-            account: self.preferredGatewayStableIDAccount
-        )?.trimmingCharacters(in: .whitespacesAndNewlines),
+            account: self.preferredGatewayStableIDAccount)?.trimmingCharacters(in: .whitespacesAndNewlines),
             !value.isEmpty
         {
             return value
@@ -69,11 +79,17 @@ enum GatewaySettingsStore {
             account: self.preferredGatewayStableIDAccount)
     }
 
+    static func clearPreferredGatewayStableID(defaults: UserDefaults = .standard) {
+        _ = KeychainStore.delete(
+            service: self.gatewayService,
+            account: self.preferredGatewayStableIDAccount)
+        defaults.removeObject(forKey: self.preferredGatewayStableIDDefaultsKey)
+    }
+
     static func loadLastDiscoveredGatewayStableID() -> String? {
         if let value = KeychainStore.loadString(
             service: self.gatewayService,
-            account: self.lastDiscoveredGatewayStableIDAccount
-        )?.trimmingCharacters(in: .whitespacesAndNewlines),
+            account: self.lastDiscoveredGatewayStableIDAccount)?.trimmingCharacters(in: .whitespacesAndNewlines),
             !value.isEmpty
         {
             return value
@@ -89,6 +105,13 @@ enum GatewaySettingsStore {
             account: self.lastDiscoveredGatewayStableIDAccount)
     }
 
+    static func clearLastDiscoveredGatewayStableID(defaults: UserDefaults = .standard) {
+        _ = KeychainStore.delete(
+            service: self.gatewayService,
+            account: self.lastDiscoveredGatewayStableIDAccount)
+        defaults.removeObject(forKey: self.lastDiscoveredGatewayStableIDDefaultsKey)
+    }
+
     static func loadGatewayToken(instanceId: String) -> String? {
         let account = self.gatewayTokenAccount(instanceId: instanceId)
         let token = KeychainStore.loadString(service: self.gatewayService, account: account)?
@@ -98,10 +121,43 @@ enum GatewaySettingsStore {
     }
 
     static func saveGatewayToken(_ token: String, instanceId: String) {
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            _ = KeychainStore.delete(
+                service: self.gatewayService,
+                account: self.gatewayTokenAccount(instanceId: instanceId))
+            return
+        }
         _ = KeychainStore.saveString(
-            token,
+            trimmed,
             service: self.gatewayService,
             account: self.gatewayTokenAccount(instanceId: instanceId))
+    }
+
+    static func loadGatewayBootstrapToken(instanceId: String) -> String? {
+        let account = self.gatewayBootstrapTokenAccount(instanceId: instanceId)
+        let token = KeychainStore.loadString(service: self.gatewayService, account: account)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if token?.isEmpty == false { return token }
+        return nil
+    }
+
+    static func saveGatewayBootstrapToken(_ token: String, instanceId: String) {
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            self.clearGatewayBootstrapToken(instanceId: instanceId)
+            return
+        }
+        _ = KeychainStore.saveString(
+            trimmed,
+            service: self.gatewayService,
+            account: self.gatewayBootstrapTokenAccount(instanceId: instanceId))
+    }
+
+    static func clearGatewayBootstrapToken(instanceId: String) {
+        _ = KeychainStore.delete(
+            service: self.gatewayService,
+            account: self.gatewayBootstrapTokenAccount(instanceId: instanceId))
     }
 
     static func loadGatewayPassword(instanceId: String) -> String? {
@@ -112,8 +168,15 @@ enum GatewaySettingsStore {
     }
 
     static func saveGatewayPassword(_ password: String, instanceId: String) {
+        let trimmed = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            _ = KeychainStore.delete(
+                service: self.gatewayService,
+                account: self.gatewayPasswordAccount(instanceId: instanceId))
+            return
+        }
         _ = KeychainStore.saveString(
-            password,
+            trimmed,
             service: self.gatewayService,
             account: self.gatewayPasswordAccount(instanceId: instanceId))
     }
@@ -125,18 +188,18 @@ enum GatewaySettingsStore {
         var stableID: String {
             switch self {
             case let .manual(_, _, _, stableID):
-                return stableID
+                stableID
             case let .discovered(stableID, _):
-                return stableID
+                stableID
             }
         }
 
         var useTLS: Bool {
             switch self {
             case let .manual(_, _, useTLS, _):
-                return useTLS
+                useTLS
             case let .discovered(_, useTLS):
-                return useTLS
+                useTLS
             }
         }
     }
@@ -257,7 +320,9 @@ enum GatewaySettingsStore {
         let port = defaults.object(forKey: self.lastGatewayPortDefaultsKey) as? Int
 
         let payload = LastGatewayConnectionData(
-            kind: kind, stableID: stableID, useTLS: useTLS,
+            kind: kind,
+            stableID: stableID,
+            useTLS: useTLS,
             host: kind == .manual ? host : nil,
             port: kind == .manual ? port : nil)
         guard self.saveLastGatewayConnectionData(payload) else { return }
@@ -278,6 +343,9 @@ enum GatewaySettingsStore {
         _ = KeychainStore.delete(
             service: self.gatewayService,
             account: self.gatewayTokenAccount(instanceId: trimmed))
+        _ = KeychainStore.delete(
+            service: self.gatewayService,
+            account: self.gatewayBootstrapTokenAccount(instanceId: trimmed))
         _ = KeychainStore.delete(
             service: self.gatewayService,
             account: self.gatewayPasswordAccount(instanceId: trimmed))
@@ -329,6 +397,10 @@ enum GatewaySettingsStore {
 
     private static func gatewayTokenAccount(instanceId: String) -> String {
         "gateway-token.\(instanceId)"
+    }
+
+    private static func gatewayBootstrapTokenAccount(instanceId: String) -> String {
+        "gateway-bootstrap-token.\(instanceId)"
     }
 
     private static func gatewayPasswordAccount(instanceId: String) -> String {
@@ -402,7 +474,6 @@ enum GatewaySettingsStore {
             defaults.set(stored, forKey: self.lastDiscoveredGatewayStableIDDefaultsKey)
         }
     }
-
 }
 
 enum GatewayDiagnostics {
@@ -412,11 +483,11 @@ enum GatewayDiagnostics {
     private static let keepLogBytes: Int64 = 256 * 1024
     private static let logSizeCheckEveryWrites = 50
     private static let logWritesSinceCheck = OSAllocatedUnfairLock(initialState: 0)
-    private static let isoFormatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
+    private static func isoTimestamp() -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: Date())
+    }
 
     private static var fileURL: URL? {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
@@ -474,9 +545,9 @@ enum GatewayDiagnostics {
 
     static func bootstrap() {
         guard let url = fileURL else { return }
-        queue.async {
+        self.queue.async {
             self.truncateLogIfNeeded(url: url)
-            let timestamp = self.isoFormatter.string(from: Date())
+            let timestamp = self.isoTimestamp()
             let line = "[\(timestamp)] gateway diagnostics started\n"
             if let data = line.data(using: .utf8) {
                 self.appendToLog(url: url, data: data)
@@ -486,12 +557,12 @@ enum GatewayDiagnostics {
     }
 
     static func log(_ message: String) {
-        let timestamp = self.isoFormatter.string(from: Date())
+        let timestamp = self.isoTimestamp()
         let line = "[\(timestamp)] \(message)"
-        logger.info("\(line, privacy: .public)")
+        self.logger.info("\(line, privacy: .public)")
 
         guard let url = fileURL else { return }
-        queue.async {
+        self.queue.async {
             let shouldTruncate = self.logWritesSinceCheck.withLock { count in
                 count += 1
                 if count >= self.logSizeCheckEveryWrites {
@@ -512,7 +583,7 @@ enum GatewayDiagnostics {
 
     static func reset() {
         guard let url = fileURL else { return }
-        queue.async {
+        self.queue.async {
             try? FileManager.default.removeItem(at: url)
         }
     }

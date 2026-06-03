@@ -1,4 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { normalizeOptionalLowercaseString } from "../../packages/normalization-core/src/string-coerce.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import {
   isRequestBodyLimitError,
   readJsonBodyWithLimit,
@@ -7,8 +9,17 @@ import {
 } from "../infra/http-body.js";
 import { pruneMapToMaxSize } from "../infra/map-size.js";
 import type { FixedWindowRateLimiter } from "./webhook-memory-guards.js";
+import { resolveWebhookIntegerOption } from "./webhook-numeric-options.js";
 
 export type WebhookBodyReadProfile = "pre-auth" | "post-auth";
+
+export {
+  installRequestBodyLimitGuard,
+  isRequestBodyLimitError,
+  readJsonBodyWithLimit,
+  readRequestBodyWithLimit,
+  requestBodyErrorToText,
+} from "../infra/http-body.js";
 
 export const WEBHOOK_BODY_READ_DEFAULTS = Object.freeze({
   preAuth: {
@@ -81,17 +92,20 @@ function respondWebhookBodyReadError(params: {
   return { ok: false };
 }
 
+/** Create an in-memory limiter that caps concurrent webhook handlers per key. */
 export function createWebhookInFlightLimiter(options?: {
   maxInFlightPerKey?: number;
   maxTrackedKeys?: number;
 }): WebhookInFlightLimiter {
-  const maxInFlightPerKey = Math.max(
-    1,
-    Math.floor(options?.maxInFlightPerKey ?? WEBHOOK_IN_FLIGHT_DEFAULTS.maxInFlightPerKey),
+  const maxInFlightPerKey = resolveWebhookIntegerOption(
+    options?.maxInFlightPerKey,
+    WEBHOOK_IN_FLIGHT_DEFAULTS.maxInFlightPerKey,
+    { min: 1 },
   );
-  const maxTrackedKeys = Math.max(
-    1,
-    Math.floor(options?.maxTrackedKeys ?? WEBHOOK_IN_FLIGHT_DEFAULTS.maxTrackedKeys),
+  const maxTrackedKeys = resolveWebhookIntegerOption(
+    options?.maxTrackedKeys,
+    WEBHOOK_IN_FLIGHT_DEFAULTS.maxTrackedKeys,
+    { min: 1 },
   );
   const active = new Map<string, number>();
 
@@ -127,15 +141,17 @@ export function createWebhookInFlightLimiter(options?: {
   };
 }
 
+/** Detect JSON content types, including structured syntax suffixes like `application/ld+json`. */
 export function isJsonContentType(value: string | string[] | undefined): boolean {
   const first = Array.isArray(value) ? value[0] : value;
   if (!first) {
     return false;
   }
-  const mediaType = first.split(";", 1)[0]?.trim().toLowerCase();
+  const mediaType = normalizeOptionalLowercaseString(first.split(";", 1)[0]);
   return mediaType === "application/json" || Boolean(mediaType?.endsWith("+json"));
 }
 
+/** Apply method, rate-limit, and content-type guards before a webhook handler reads the body. */
 export function applyBasicWebhookRequestGuards(params: {
   req: IncomingMessage;
   res: ServerResponse;
@@ -176,6 +192,7 @@ export function applyBasicWebhookRequestGuards(params: {
   return true;
 }
 
+/** Start the shared webhook request lifecycle and return a release hook for in-flight tracking. */
 export function beginWebhookRequestPipelineOrReject(params: {
   req: IncomingMessage;
   res: ServerResponse;
@@ -226,6 +243,7 @@ export function beginWebhookRequestPipelineOrReject(params: {
   };
 }
 
+/** Read a webhook request body with bounded size/time limits and translate failures into responses. */
 export async function readWebhookBodyOrReject(params: {
   req: IncomingMessage;
   res: ServerResponse;
@@ -254,12 +272,12 @@ export async function readWebhookBodyOrReject(params: {
     return respondWebhookBodyReadError({
       res: params.res,
       code: "INVALID_BODY",
-      invalidMessage:
-        params.invalidBodyMessage ?? (error instanceof Error ? error.message : String(error)),
+      invalidMessage: params.invalidBodyMessage ?? formatErrorMessage(error),
     });
   }
 }
 
+/** Read and parse a JSON webhook body, rejecting malformed or oversized payloads consistently. */
 export async function readJsonWebhookBodyOrReject(params: {
   req: IncomingMessage;
   res: ServerResponse;

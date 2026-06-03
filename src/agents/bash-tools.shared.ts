@@ -2,8 +2,10 @@ import { existsSync, statSync } from "node:fs";
 import fs from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { parseStrictInteger } from "@openclaw/normalization-core/number-coercion";
 import { sliceUtf16Safe } from "../utils.js";
 import { assertSandboxPath } from "./sandbox-paths.js";
+import type { SandboxBackendExecSpec } from "./sandbox/backend-handle.types.js";
 
 const CHUNK_LIMIT = 8 * 1024;
 
@@ -12,6 +14,18 @@ export type BashSandboxConfig = {
   workspaceDir: string;
   containerWorkdir: string;
   env?: Record<string, string>;
+  buildExecSpec?: (params: {
+    command: string;
+    workdir?: string;
+    env: Record<string, string>;
+    usePty: boolean;
+  }) => Promise<SandboxBackendExecSpec>;
+  finalizeExec?: (params: {
+    status: "completed" | "failed";
+    exitCode: number | null;
+    timedOut: boolean;
+    token?: unknown;
+  }) => Promise<void>;
 };
 
 export function buildSandboxEnv(params: {
@@ -194,13 +208,9 @@ export function clampWithDefault(
   return Math.min(Math.max(value, min), max);
 }
 
-export function readEnvInt(key: string) {
-  const raw = process.env[key];
-  if (!raw) {
-    return undefined;
-  }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
+export function readEnvInt(key: string, legacyKey?: string) {
+  const raw = process.env[key] || (legacyKey ? process.env[legacyKey] : undefined);
+  return parseStrictInteger(raw);
 }
 
 export function chunkString(input: string, limit = CHUNK_LIMIT) {

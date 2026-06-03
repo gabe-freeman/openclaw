@@ -1,5 +1,6 @@
+import { formatCliCommand } from "../../cli/command-format.js";
 import { logConfigUpdated } from "../../config/logging.js";
-import type { RuntimeEnv } from "../../runtime.js";
+import { type RuntimeEnv, writeRuntimeJson } from "../../runtime.js";
 import { loadModelsConfig } from "./load-config.js";
 import {
   ensureFlagCompatibility,
@@ -27,7 +28,7 @@ export async function modelsAliasesListCommand(
   );
 
   if (opts.json) {
-    runtime.log(JSON.stringify({ aliases }, null, 2));
+    writeRuntimeJson(runtime, { aliases });
     return;
   }
   if (opts.plain) {
@@ -55,9 +56,9 @@ export async function modelsAliasesAddCommand(
   const alias = normalizeAlias(aliasRaw);
   const cfg = await loadModelsConfig({ commandName: "models aliases add", runtime });
   const resolved = resolveModelTarget({ raw: modelRaw, cfg });
-  const _updated = await updateConfig((cfg) => {
+  await updateConfig((cfgLocal) => {
     const modelKey = `${resolved.provider}/${resolved.model}`;
-    const nextModels = { ...cfg.agents?.defaults?.models };
+    const nextModels = { ...cfgLocal.agents?.defaults?.models };
     for (const [key, entry] of Object.entries(nextModels)) {
       const existing = entry?.alias?.trim();
       if (existing && existing === alias && key !== modelKey) {
@@ -67,11 +68,11 @@ export async function modelsAliasesAddCommand(
     const existing = nextModels[modelKey] ?? {};
     nextModels[modelKey] = { ...existing, alias };
     return {
-      ...cfg,
+      ...cfgLocal,
       agents: {
-        ...cfg.agents,
+        ...cfgLocal.agents,
         defaults: {
-          ...cfg.agents?.defaults,
+          ...cfgLocal.agents?.defaults,
           models: nextModels,
         },
       },
@@ -95,7 +96,9 @@ export async function modelsAliasesRemoveCommand(aliasRaw: string, runtime: Runt
       }
     }
     if (!found) {
-      throw new Error(`Alias not found: ${alias}`);
+      throw new Error(
+        `Alias not found: ${alias}. Run ${formatCliCommand("openclaw models aliases list")} to see configured aliases.`,
+      );
     }
     return {
       ...cfg,

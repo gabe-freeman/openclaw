@@ -3,27 +3,41 @@ import {
   readFileUtf8AndCleanup,
   stubFetchTextResponse,
 } from "../test-utils/camera-url-test-helpers.js";
+import { createNodesTool } from "./tools/nodes-tool.js";
 
 const { callGateway } = vi.hoisted(() => ({
   callGateway: vi.fn(),
 }));
 
 vi.mock("../gateway/call.js", () => ({ callGateway }));
-vi.mock("../media/image-ops.js", () => ({
+vi.mock("../media/media-services.js", () => ({
   getImageMetadata: vi.fn(async () => ({ width: 1, height: 1 })),
   resizeToJpeg: vi.fn(async () => Buffer.from("jpeg")),
 }));
 
-import "./test-helpers/fast-core-tools.js";
-import { createOpenClawTools } from "./openclaw-tools.js";
-
 const NODE_ID = "mac-1";
-const BASE_RUN_INPUT = { action: "run", node: NODE_ID, command: ["echo", "hi"] } as const;
 const JPG_PAYLOAD = {
   format: "jpg",
   base64: "aGVsbG8=",
   width: 1,
   height: 1,
+} as const;
+const PHOTOS_LATEST_ACTION_INPUT = { action: "photos_latest", node: NODE_ID } as const;
+const PHOTOS_LATEST_DEFAULT_PARAMS = {
+  limit: 1,
+  maxWidth: 1600,
+  quality: 0.85,
+} as const;
+const PHOTOS_LATEST_PAYLOAD = {
+  photos: [
+    {
+      format: "jpeg",
+      base64: "aGVsbG8=",
+      width: 1,
+      height: 1,
+      createdAt: "2026-03-04T00:00:00Z",
+    },
+  ],
 } as const;
 
 type GatewayCall = { method: string; params?: unknown };
@@ -32,20 +46,50 @@ function unexpectedGatewayMethod(method: unknown): never {
   throw new Error(`unexpected method: ${String(method)}`);
 }
 
-function getNodesTool() {
-  const tool = createOpenClawTools().find((candidate) => candidate.name === "nodes");
-  if (!tool) {
-    throw new Error("missing nodes tool");
-  }
-  return tool;
+function getNodesTool(options?: { modelHasVision?: boolean; allowMediaInvokeCommands?: boolean }) {
+  return createNodesTool({
+    ...(options?.modelHasVision !== undefined ? { modelHasVision: options.modelHasVision } : {}),
+    ...(options?.allowMediaInvokeCommands !== undefined
+      ? { allowMediaInvokeCommands: options.allowMediaInvokeCommands }
+      : {}),
+  });
 }
 
-async function executeNodes(input: Record<string, unknown>) {
-  return getNodesTool().execute("call1", input as never);
+async function executeNodes(
+  input: Record<string, unknown>,
+  options?: { modelHasVision?: boolean; allowMediaInvokeCommands?: boolean },
+) {
+  return getNodesTool(options).execute("call1", input as never);
 }
 
 type NodesToolResult = Awaited<ReturnType<typeof executeNodes>>;
 type GatewayMockResult = Record<string, unknown> | null | undefined;
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`expected ${label}`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function expectInvokeParams(
+  invokeParams: unknown,
+  expected: {
+    command: string;
+    nodeId?: string;
+    params?: Record<string, unknown>;
+  },
+) {
+  const record = requireRecord(invokeParams, "node.invoke params");
+  expect(record.command).toBe(expected.command);
+  if (expected.nodeId !== undefined) {
+    expect(record.nodeId).toBe(expected.nodeId);
+  }
+  const params = requireRecord(record.params, `${expected.command} params`);
+  for (const [key, value] of Object.entries(expected.params ?? {})) {
+    expect(params[key]).toEqual(value);
+  }
+}
 
 function mockNodeList(params?: { commands?: string[]; remoteIp?: string }) {
   return {
@@ -61,17 +105,39 @@ function mockNodeList(params?: { commands?: string[]; remoteIp?: string }) {
 
 function expectSingleImage(result: NodesToolResult, params?: { mimeType?: string }) {
   const images = (result.content ?? []).filter((block) => block.type === "image");
-  expect(images).toHaveLength(1);
-  if (params?.mimeType) {
-    expect(images[0]?.mimeType).toBe(params.mimeType);
-  }
+  expect(images).toEqual([
+    {
+      type: "image",
+      data: JPG_PAYLOAD.base64,
+      mimeType: params?.mimeType ?? "image/jpeg",
+    },
+  ]);
+}
+
+function expectNoImages(result: NodesToolResult) {
+  const images = (result.content ?? []).filter((block) => block.type === "image");
+  expect(images).toHaveLength(0);
+}
+
+function expectFirstMediaUrl(result: NodesToolResult): string {
+  const details = result.details as { media?: { mediaUrls?: string[] } } | undefined;
+  const mediaUrl = details?.media?.mediaUrls?.[0];
+  expect(typeof mediaUrl).toBe("string");
+  return mediaUrl ?? "";
 }
 
 function expectFirstTextContains(result: NodesToolResult, expectedText: string) {
-  expect(result.content?.[0]).toMatchObject({
-    type: "text",
-    text: expect.stringContaining(expectedText),
-  });
+  const first = result.content?.[0];
+  expect(first?.type).toBe("text");
+  const text = first?.type === "text" ? first.text : "";
+  expect(text).toContain(expectedText);
+}
+
+function parseFirstTextJson(result: NodesToolResult): unknown {
+  const first = result.content?.[0];
+  expect(first?.type).toBe("text");
+  const text = first?.type === "text" ? first.text : "";
+  return JSON.parse(text);
 }
 
 function setupNodeInvokeMock(params: {
@@ -97,41 +163,22 @@ function setupNodeInvokeMock(params: {
   });
 }
 
-function createSystemRunPreparePayload(cwd: string | null) {
-  return {
-    payload: {
-      cmdText: "echo hi",
-      plan: {
-        argv: ["echo", "hi"],
-        cwd,
-        rawCommand: "echo hi",
-        agentId: null,
-        sessionKey: null,
-      },
+function setupPhotosLatestMock(params?: { remoteIp?: string }) {
+  setupNodeInvokeMock({
+    ...(params?.remoteIp ? { remoteIp: params.remoteIp } : {}),
+    onInvoke: (invokeParams) => {
+      expectInvokeParams(invokeParams, {
+        command: "photos.latest",
+        params: PHOTOS_LATEST_DEFAULT_PARAMS,
+      });
+      return { payload: PHOTOS_LATEST_PAYLOAD };
     },
-  };
+  });
 }
 
-function setupSystemRunGateway(params: {
-  onRunInvoke: (invokeParams: unknown) => GatewayMockResult | Promise<GatewayMockResult>;
-  onApprovalRequest?: (approvalParams: unknown) => GatewayMockResult | Promise<GatewayMockResult>;
-  prepareCwd?: string | null;
-}) {
-  callGateway.mockImplementation(async ({ method, params: gatewayParams }: GatewayCall) => {
-    if (method === "node.list") {
-      return mockNodeList({ commands: ["system.run"] });
-    }
-    if (method === "node.invoke") {
-      const command = (gatewayParams as { command?: string } | undefined)?.command;
-      if (command === "system.run.prepare") {
-        return createSystemRunPreparePayload(params.prepareCwd ?? null);
-      }
-      return await params.onRunInvoke(gatewayParams);
-    }
-    if (method === "exec.approval.request" && params.onApprovalRequest) {
-      return await params.onApprovalRequest(gatewayParams);
-    }
-    return unexpectedGatewayMethod(method);
+async function executePhotosLatest(params: { modelHasVision: boolean }) {
+  return executeNodes(PHOTOS_LATEST_ACTION_INPUT, {
+    modelHasVision: params.modelHasVision,
   });
 }
 
@@ -144,7 +191,7 @@ describe("nodes camera_snap", () => {
   it("uses front/high-quality defaults when params are omitted", async () => {
     setupNodeInvokeMock({
       onInvoke: (invokeParams) => {
-        expect(invokeParams).toMatchObject({
+        expectInvokeParams(invokeParams, {
           command: "camera.snap",
           params: {
             facing: "front",
@@ -156,10 +203,13 @@ describe("nodes camera_snap", () => {
       },
     });
 
-    const result = await executeNodes({
-      action: "camera_snap",
-      node: NODE_ID,
-    });
+    const result = await executeNodes(
+      {
+        action: "camera_snap",
+        node: NODE_ID,
+      },
+      { modelHasVision: true },
+    );
 
     expectSingleImage(result);
   });
@@ -169,19 +219,41 @@ describe("nodes camera_snap", () => {
       invokePayload: JPG_PAYLOAD,
     });
 
-    const result = await executeNodes({
-      action: "camera_snap",
-      node: NODE_ID,
-      facing: "front",
-    });
+    const result = await executeNodes(
+      {
+        action: "camera_snap",
+        node: NODE_ID,
+        facing: "front",
+      },
+      { modelHasVision: true },
+    );
 
     expectSingleImage(result, { mimeType: "image/jpeg" });
+  });
+
+  it("omits inline base64 image blocks when model has no vision", async () => {
+    setupNodeInvokeMock({
+      invokePayload: JPG_PAYLOAD,
+    });
+
+    const result = await executeNodes(
+      {
+        action: "camera_snap",
+        node: NODE_ID,
+        facing: "front",
+      },
+      { modelHasVision: false },
+    );
+
+    expectNoImages(result);
+    expect(result.content ?? []).toStrictEqual([]);
+    expect(expectFirstMediaUrl(result)).toMatch(/openclaw-camera-snap-front-.*\.jpg$/);
   });
 
   it("passes deviceId when provided", async () => {
     setupNodeInvokeMock({
       onInvoke: (invokeParams) => {
-        expect(invokeParams).toMatchObject({
+        expectInvokeParams(invokeParams, {
           command: "camera.snap",
           params: { deviceId: "cam-123" },
         });
@@ -226,11 +298,8 @@ describe("nodes camera_snap", () => {
       facing: "front",
     });
 
-    expect(result.content?.[0]).toMatchObject({ type: "text" });
-    const mediaPath = String((result.content?.[0] as { text?: string } | undefined)?.text ?? "")
-      .replace(/^MEDIA:/, "")
-      .trim();
-    await expect(readFileUtf8AndCleanup(mediaPath)).resolves.toBe("url-image");
+    expect(result.content ?? []).toStrictEqual([]);
+    await expect(readFileUtf8AndCleanup(expectFirstMediaUrl(result))).resolves.toBe("url-image");
   });
 
   it("rejects camera_snap url payloads when node remoteIp is missing", async () => {
@@ -272,7 +341,7 @@ describe("nodes camera_clip", () => {
       node: NODE_ID,
       facing: "front",
     });
-    const filePath = String((result.content?.[0] as { text?: string } | undefined)?.text ?? "")
+    const filePath = ((result.content?.[0] as { text?: string } | undefined)?.text ?? "")
       .replace(/^FILE:/, "")
       .trim();
     await expect(readFileUtf8AndCleanup(filePath)).resolves.toBe("url-clip");
@@ -299,12 +368,69 @@ describe("nodes camera_clip", () => {
   });
 });
 
+describe("nodes photos_latest", () => {
+  it("returns empty content/details when no photos are available", async () => {
+    setupNodeInvokeMock({
+      onInvoke: (invokeParams) => {
+        expectInvokeParams(invokeParams, {
+          command: "photos.latest",
+          params: {
+            limit: 1,
+            maxWidth: 1600,
+            quality: 0.85,
+          },
+        });
+        return {
+          payload: {
+            photos: [],
+          },
+        };
+      },
+    });
+
+    const result = await executeNodes(
+      {
+        action: "photos_latest",
+        node: NODE_ID,
+      },
+      { modelHasVision: false },
+    );
+
+    expect(result.content ?? []).toStrictEqual([]);
+    expect(result.details).toStrictEqual([]);
+  });
+
+  it("returns MEDIA paths and no inline images when model has no vision", async () => {
+    setupPhotosLatestMock({ remoteIp: "198.51.100.42" });
+
+    const result = await executePhotosLatest({ modelHasVision: false });
+
+    expectNoImages(result);
+    expect(result.content ?? []).toStrictEqual([]);
+    const details =
+      (result.details as { photos?: Array<Record<string, unknown>> } | undefined)?.photos ?? [];
+    expect(details[0]?.width).toBe(1);
+    expect(details[0]?.height).toBe(1);
+    expect(details[0]?.createdAt).toBe("2026-03-04T00:00:00Z");
+    expect(expectFirstMediaUrl(result)).toMatch(/openclaw-camera-snap-.*\.jpg$/);
+  });
+
+  it("includes inline image blocks when model has vision", async () => {
+    setupPhotosLatestMock();
+
+    const result = await executePhotosLatest({ modelHasVision: true });
+
+    expectSingleImage(result, { mimeType: "image/jpeg" });
+    expect(expectFirstMediaUrl(result)).toMatch(/openclaw-camera-snap-.*\.jpg$/);
+  });
+});
+
 describe("nodes notifications_list", () => {
   it("invokes notifications.list and returns payload", async () => {
     setupNodeInvokeMock({
       commands: ["notifications.list"],
       onInvoke: (invokeParams) => {
-        expect(invokeParams).toMatchObject({
+        expectInvokeParams(invokeParams, {
           nodeId: NODE_ID,
           command: "notifications.list",
           params: {},
@@ -326,6 +452,12 @@ describe("nodes notifications_list", () => {
     });
 
     expectFirstTextContains(result, '"notifications"');
+    expect(parseFirstTextJson(result)).toStrictEqual({
+      enabled: true,
+      connected: true,
+      count: 1,
+      notifications: [{ key: "n1", packageName: "com.example.app" }],
+    });
   });
 });
 
@@ -334,7 +466,7 @@ describe("nodes notifications_action", () => {
     setupNodeInvokeMock({
       commands: ["notifications.actions"],
       onInvoke: (invokeParams) => {
-        expect(invokeParams).toMatchObject({
+        expectInvokeParams(invokeParams, {
           nodeId: NODE_ID,
           command: "notifications.actions",
           params: {
@@ -354,6 +486,85 @@ describe("nodes notifications_action", () => {
     });
 
     expectFirstTextContains(result, '"dismiss"');
+    expect(parseFirstTextJson(result)).toStrictEqual({
+      ok: true,
+      key: "n1",
+      action: "dismiss",
+    });
+  });
+
+  it("invokes notifications.actions reply with reply text", async () => {
+    setupNodeInvokeMock({
+      commands: ["notifications.actions"],
+      onInvoke: (invokeParams) => {
+        expectInvokeParams(invokeParams, {
+          nodeId: NODE_ID,
+          command: "notifications.actions",
+          params: {
+            key: "n2",
+            action: "reply",
+            replyText: "On it",
+          },
+        });
+        return { payload: { ok: true, key: "n2", action: "reply" } };
+      },
+    });
+
+    const result = await executeNodes({
+      action: "notifications_action",
+      node: NODE_ID,
+      notificationKey: "n2",
+      notificationAction: "reply",
+      notificationReplyText: " On it ",
+    });
+
+    expect(parseFirstTextJson(result)).toStrictEqual({
+      ok: true,
+      key: "n2",
+      action: "reply",
+    });
+  });
+});
+
+describe("nodes location_get", () => {
+  it("invokes location.get and returns payload", async () => {
+    setupNodeInvokeMock({
+      commands: ["location.get"],
+      onInvoke: (invokeParams) => {
+        expectInvokeParams(invokeParams, {
+          nodeId: NODE_ID,
+          command: "location.get",
+          params: {
+            maxAgeMs: 12_000,
+            desiredAccuracy: "balanced",
+            timeoutMs: 4_500,
+          },
+        });
+        return {
+          payload: {
+            latitude: 37.3346,
+            longitude: -122.009,
+            accuracyMeters: 18,
+            provider: "network",
+          },
+        };
+      },
+    });
+
+    const result = await executeNodes({
+      action: "location_get",
+      node: NODE_ID,
+      maxAgeMs: 12_000,
+      desiredAccuracy: "balanced",
+      locationTimeoutMs: 4_500,
+    });
+
+    expect(parseFirstTextJson(result)).toStrictEqual({
+      latitude: 37.3346,
+      longitude: -122.009,
+      accuracyMeters: 18,
+      provider: "network",
+    });
   });
 });
 
@@ -362,7 +573,7 @@ describe("nodes device_status and device_info", () => {
     setupNodeInvokeMock({
       commands: ["device.status", "device.info"],
       onInvoke: (invokeParams) => {
-        expect(invokeParams).toMatchObject({
+        expectInvokeParams(invokeParams, {
           nodeId: NODE_ID,
           command: "device.status",
           params: {},
@@ -387,7 +598,7 @@ describe("nodes device_status and device_info", () => {
     setupNodeInvokeMock({
       commands: ["device.status", "device.info"],
       onInvoke: (invokeParams) => {
-        expect(invokeParams).toMatchObject({
+        expectInvokeParams(invokeParams, {
           nodeId: NODE_ID,
           command: "device.info",
           params: {},
@@ -413,7 +624,7 @@ describe("nodes device_status and device_info", () => {
     setupNodeInvokeMock({
       commands: ["device.permissions"],
       onInvoke: (invokeParams) => {
-        expect(invokeParams).toMatchObject({
+        expectInvokeParams(invokeParams, {
           nodeId: NODE_ID,
           command: "device.permissions",
           params: {},
@@ -422,6 +633,14 @@ describe("nodes device_status and device_info", () => {
           payload: {
             permissions: {
               camera: { status: "granted", promptable: false },
+              sms: {
+                status: "denied",
+                promptable: true,
+                capabilities: {
+                  send: { status: "denied", promptable: true },
+                  read: { status: "granted", promptable: false },
+                },
+              },
             },
           },
         };
@@ -434,13 +653,21 @@ describe("nodes device_status and device_info", () => {
     });
 
     expectFirstTextContains(result, '"permissions"');
+    const parsed = requireRecord(parseFirstTextJson(result), "device permissions payload");
+    const permissions = requireRecord(parsed.permissions, "permissions");
+    const sms = requireRecord(permissions.sms, "sms permissions");
+    expect(sms.status).toBe("denied");
+    expect(sms.promptable).toBe(true);
+    const capabilities = requireRecord(sms.capabilities, "sms capabilities");
+    expect(capabilities.send).toStrictEqual({ status: "denied", promptable: true });
+    expect(capabilities.read).toStrictEqual({ status: "granted", promptable: false });
   });
 
   it("invokes device.health and returns payload", async () => {
     setupNodeInvokeMock({
       commands: ["device.health"],
       onInvoke: (invokeParams) => {
-        expect(invokeParams).toMatchObject({
+        expectInvokeParams(invokeParams, {
           nodeId: NODE_ID,
           command: "device.health",
           params: {},
@@ -463,116 +690,73 @@ describe("nodes device_status and device_info", () => {
   });
 });
 
-describe("nodes run", () => {
-  it("passes invoke and command timeouts", async () => {
-    setupSystemRunGateway({
-      prepareCwd: "/tmp",
-      onRunInvoke: (invokeParams) => {
-        expect(invokeParams).toMatchObject({
-          nodeId: NODE_ID,
-          command: "system.run",
-          timeoutMs: 45_000,
-          params: {
-            command: ["echo", "hi"],
-            cwd: "/tmp",
-            env: { FOO: "bar" },
-            timeoutMs: 12_000,
-          },
+describe("nodes invoke", () => {
+  it("allows metadata-only camera.list via generic invoke", async () => {
+    setupNodeInvokeMock({
+      onInvoke: (invokeParams) => {
+        expectInvokeParams(invokeParams, {
+          command: "camera.list",
+          params: {},
         });
         return {
-          payload: { stdout: "", stderr: "", exitCode: 0, success: true },
+          payload: {
+            devices: [{ id: "cam-back", name: "Back Camera" }],
+          },
         };
       },
     });
 
-    await executeNodes({
-      ...BASE_RUN_INPUT,
-      cwd: "/tmp",
-      env: ["FOO=bar"],
-      commandTimeoutMs: 12_000,
-      invokeTimeoutMs: 45_000,
+    const result = await executeNodes({
+      action: "invoke",
+      node: NODE_ID,
+      invokeCommand: "camera.list",
+    });
+
+    const details = requireRecord(result.details, "camera.list details");
+    expect(details.payload).toStrictEqual({
+      devices: [{ id: "cam-back", name: "Back Camera" }],
     });
   });
 
-  it("requests approval and retries with allow-once decision", async () => {
-    let invokeCalls = 0;
-    let approvalId: string | null = null;
-    setupSystemRunGateway({
-      onRunInvoke: (invokeParams) => {
-        invokeCalls += 1;
-        if (invokeCalls === 1) {
-          throw new Error("SYSTEM_RUN_DENIED: approval required");
-        }
-        expect(invokeParams).toMatchObject({
-          nodeId: NODE_ID,
-          command: "system.run",
-          params: {
-            command: ["echo", "hi"],
-            runId: approvalId,
-            approved: true,
-            approvalDecision: "allow-once",
+  it("blocks media invoke commands to avoid base64 context bloat", async () => {
+    await expect(
+      executeNodes({
+        action: "invoke",
+        node: NODE_ID,
+        invokeCommand: "photos.latest",
+        invokeParamsJson: '{"limit":1}',
+      }),
+    ).rejects.toThrow(/use action="photos_latest"/i);
+  });
+
+  it("allows media invoke commands when explicitly enabled", async () => {
+    setupNodeInvokeMock({
+      onInvoke: (invokeParams) => {
+        expectInvokeParams(invokeParams, {
+          command: "photos.latest",
+          params: { limit: 1 },
+        });
+        return {
+          payload: {
+            photos: [{ format: "jpg", base64: "aGVsbG8=", width: 1, height: 1 }],
           },
-        });
-        return { payload: { stdout: "", stderr: "", exitCode: 0, success: true } };
-      },
-      onApprovalRequest: (approvalParams) => {
-        expect(approvalParams).toMatchObject({
-          id: expect.any(String),
-          command: "echo hi",
-          commandArgv: ["echo", "hi"],
-          systemRunPlan: expect.objectContaining({
-            argv: ["echo", "hi"],
-          }),
-          nodeId: NODE_ID,
-          host: "node",
-          timeoutMs: 120_000,
-        });
-        approvalId =
-          typeof (approvalParams as { id?: unknown } | undefined)?.id === "string"
-            ? ((approvalParams as { id: string }).id ?? null)
-            : null;
-        return { decision: "allow-once" };
+        };
       },
     });
 
-    await executeNodes(BASE_RUN_INPUT);
-    expect(invokeCalls).toBe(2);
-  });
-
-  it("fails with user denied when approval decision is deny", async () => {
-    setupSystemRunGateway({
-      onRunInvoke: () => {
-        throw new Error("SYSTEM_RUN_DENIED: approval required");
+    const result = await executeNodes(
+      {
+        action: "invoke",
+        node: NODE_ID,
+        invokeCommand: "photos.latest",
+        invokeParamsJson: '{"limit":1}',
       },
-      onApprovalRequest: () => {
-        return { decision: "deny" };
-      },
-    });
-
-    await expect(executeNodes(BASE_RUN_INPUT)).rejects.toThrow("exec denied: user denied");
-  });
-
-  it("fails closed for timeout and invalid approval decisions", async () => {
-    setupSystemRunGateway({
-      onRunInvoke: () => {
-        throw new Error("SYSTEM_RUN_DENIED: approval required");
-      },
-      onApprovalRequest: () => {
-        return {};
-      },
-    });
-    await expect(executeNodes(BASE_RUN_INPUT)).rejects.toThrow("exec denied: approval timed out");
-
-    setupSystemRunGateway({
-      onRunInvoke: () => {
-        throw new Error("SYSTEM_RUN_DENIED: approval required");
-      },
-      onApprovalRequest: () => {
-        return { decision: "allow-never" };
-      },
-    });
-    await expect(executeNodes(BASE_RUN_INPUT)).rejects.toThrow(
-      "exec denied: invalid approval decision",
+      { allowMediaInvokeCommands: true },
     );
+
+    const details = requireRecord(result.details, "photos.latest invoke details");
+    expect(details.payload).toStrictEqual({
+      photos: [{ format: "jpg", base64: "aGVsbG8=", width: 1, height: 1 }],
+    });
   });
 });

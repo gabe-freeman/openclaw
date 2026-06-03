@@ -1,8 +1,27 @@
-import type { RuntimeEnv } from "openclaw/plugin-sdk";
+import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/number-runtime";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import type { RuntimeEnv } from "../runtime-api.js";
 import { probeFeishu } from "./probe.js";
 import type { ResolvedFeishuAccount } from "./types.js";
 
-export const FEISHU_STARTUP_BOT_INFO_TIMEOUT_MS = 10_000;
+const FEISHU_STARTUP_BOT_INFO_TIMEOUT_DEFAULT_MS = 30_000;
+const FEISHU_STARTUP_BOT_INFO_TIMEOUT_ENV = "OPENCLAW_FEISHU_STARTUP_PROBE_TIMEOUT_MS";
+
+export function resolveStartupProbeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[FEISHU_STARTUP_BOT_INFO_TIMEOUT_ENV];
+  if (raw) {
+    const parsed = parseStrictPositiveInteger(raw);
+    if (parsed !== undefined) {
+      return parsed;
+    }
+    console.warn(
+      `[feishu] ${FEISHU_STARTUP_BOT_INFO_TIMEOUT_ENV}="${raw}" is invalid; using default ${FEISHU_STARTUP_BOT_INFO_TIMEOUT_DEFAULT_MS}ms`,
+    );
+  }
+  return FEISHU_STARTUP_BOT_INFO_TIMEOUT_DEFAULT_MS;
+}
+
+const FEISHU_STARTUP_BOT_INFO_TIMEOUT_MS = resolveStartupProbeTimeoutMs();
 
 type FetchBotOpenIdOptions = {
   runtime?: RuntimeEnv;
@@ -10,22 +29,26 @@ type FetchBotOpenIdOptions = {
   timeoutMs?: number;
 };
 
+export type FeishuMonitorBotIdentity = {
+  botOpenId?: string;
+  botName?: string;
+};
+
 function isTimeoutErrorMessage(message: string | undefined): boolean {
-  return message?.toLowerCase().includes("timeout") || message?.toLowerCase().includes("timed out")
-    ? true
-    : false;
+  const lower = normalizeLowercaseStringOrEmpty(message);
+  return lower.includes("timeout") || lower.includes("timed out");
 }
 
 function isAbortErrorMessage(message: string | undefined): boolean {
-  return message?.toLowerCase().includes("aborted") ?? false;
+  return normalizeLowercaseStringOrEmpty(message).includes("aborted");
 }
 
-export async function fetchBotOpenIdForMonitor(
+export async function fetchBotIdentityForMonitor(
   account: ResolvedFeishuAccount,
   options: FetchBotOpenIdOptions = {},
-): Promise<string | undefined> {
+): Promise<FeishuMonitorBotIdentity> {
   if (options.abortSignal?.aborted) {
-    return undefined;
+    return {};
   }
 
   const timeoutMs = options.timeoutMs ?? FEISHU_STARTUP_BOT_INFO_TIMEOUT_MS;
@@ -34,18 +57,19 @@ export async function fetchBotOpenIdForMonitor(
     abortSignal: options.abortSignal,
   });
   if (result.ok) {
-    return result.botOpenId;
+    return { botOpenId: result.botOpenId, botName: result.botName };
   }
 
-  if (options.abortSignal?.aborted || isAbortErrorMessage(result.error)) {
-    return undefined;
+  const probeError = result.error ?? undefined;
+  if (options.abortSignal?.aborted || isAbortErrorMessage(probeError)) {
+    return {};
   }
 
-  if (isTimeoutErrorMessage(result.error)) {
+  if (isTimeoutErrorMessage(probeError)) {
     const error = options.runtime?.error ?? console.error;
     error(
       `feishu[${account.accountId}]: bot info probe timed out after ${timeoutMs}ms; continuing startup`,
     );
   }
-  return undefined;
+  return {};
 }

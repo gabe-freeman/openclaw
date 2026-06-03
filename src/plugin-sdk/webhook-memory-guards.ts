@@ -1,4 +1,5 @@
 import { pruneMapToMaxSize } from "../infra/map-size.js";
+import { resolveWebhookIntegerOption } from "./webhook-numeric-options.js";
 
 type FixedWindowState = {
   count: number;
@@ -48,16 +49,33 @@ export type WebhookAnomalyTracker = {
   clear: () => void;
 };
 
+/** Create a simple fixed-window rate limiter for in-memory webhook protection. */
 export function createFixedWindowRateLimiter(options: {
   windowMs: number;
   maxRequests: number;
   maxTrackedKeys: number;
   pruneIntervalMs?: number;
 }): FixedWindowRateLimiter {
-  const windowMs = Math.max(1, Math.floor(options.windowMs));
-  const maxRequests = Math.max(1, Math.floor(options.maxRequests));
-  const maxTrackedKeys = Math.max(1, Math.floor(options.maxTrackedKeys));
-  const pruneIntervalMs = Math.max(1, Math.floor(options.pruneIntervalMs ?? windowMs));
+  const windowMs = resolveWebhookIntegerOption(
+    options.windowMs,
+    WEBHOOK_RATE_LIMIT_DEFAULTS.windowMs,
+    {
+      min: 1,
+    },
+  );
+  const maxRequests = resolveWebhookIntegerOption(
+    options.maxRequests,
+    WEBHOOK_RATE_LIMIT_DEFAULTS.maxRequests,
+    { min: 1 },
+  );
+  const maxTrackedKeys = resolveWebhookIntegerOption(
+    options.maxTrackedKeys,
+    WEBHOOK_RATE_LIMIT_DEFAULTS.maxTrackedKeys,
+    { min: 1 },
+  );
+  const pruneIntervalMs = resolveWebhookIntegerOption(options.pruneIntervalMs, windowMs, {
+    min: 1,
+  });
   const state = new Map<string, FixedWindowState>();
   let lastPruneMs = 0;
 
@@ -104,16 +122,22 @@ export function createFixedWindowRateLimiter(options: {
   };
 }
 
+/** Count keyed events in memory with optional TTL pruning and bounded cardinality. */
 export function createBoundedCounter(options: {
   maxTrackedKeys: number;
   ttlMs?: number;
   pruneIntervalMs?: number;
 }): BoundedCounter {
-  const maxTrackedKeys = Math.max(1, Math.floor(options.maxTrackedKeys));
-  const ttlMs = Math.max(0, Math.floor(options.ttlMs ?? 0));
-  const pruneIntervalMs = Math.max(
-    1,
-    Math.floor(options.pruneIntervalMs ?? (ttlMs > 0 ? ttlMs : 60_000)),
+  const maxTrackedKeys = resolveWebhookIntegerOption(
+    options.maxTrackedKeys,
+    WEBHOOK_ANOMALY_COUNTER_DEFAULTS.maxTrackedKeys,
+    { min: 1 },
+  );
+  const ttlMs = resolveWebhookIntegerOption(options.ttlMs, 0, { min: 0 });
+  const pruneIntervalMs = resolveWebhookIntegerOption(
+    options.pruneIntervalMs,
+    ttlMs > 0 ? ttlMs : 60_000,
+    { min: 1 },
   );
   const counters = new Map<string, CounterState>();
   let lastPruneMs = 0;
@@ -161,20 +185,27 @@ export function createBoundedCounter(options: {
   };
 }
 
+/** Track repeated webhook failures and emit sampled logs for suspicious request patterns. */
 export function createWebhookAnomalyTracker(options?: {
   maxTrackedKeys?: number;
   ttlMs?: number;
   logEvery?: number;
   trackedStatusCodes?: readonly number[];
 }): WebhookAnomalyTracker {
-  const maxTrackedKeys = Math.max(
-    1,
-    Math.floor(options?.maxTrackedKeys ?? WEBHOOK_ANOMALY_COUNTER_DEFAULTS.maxTrackedKeys),
+  const maxTrackedKeys = resolveWebhookIntegerOption(
+    options?.maxTrackedKeys,
+    WEBHOOK_ANOMALY_COUNTER_DEFAULTS.maxTrackedKeys,
+    { min: 1 },
   );
-  const ttlMs = Math.max(0, Math.floor(options?.ttlMs ?? WEBHOOK_ANOMALY_COUNTER_DEFAULTS.ttlMs));
-  const logEvery = Math.max(
-    1,
-    Math.floor(options?.logEvery ?? WEBHOOK_ANOMALY_COUNTER_DEFAULTS.logEvery),
+  const ttlMs = resolveWebhookIntegerOption(
+    options?.ttlMs,
+    WEBHOOK_ANOMALY_COUNTER_DEFAULTS.ttlMs,
+    { min: 0 },
+  );
+  const logEvery = resolveWebhookIntegerOption(
+    options?.logEvery,
+    WEBHOOK_ANOMALY_COUNTER_DEFAULTS.logEvery,
+    { min: 1 },
   );
   const trackedStatusCodes = new Set(options?.trackedStatusCodes ?? WEBHOOK_ANOMALY_STATUS_CODES);
   const counter = createBoundedCounter({ maxTrackedKeys, ttlMs });

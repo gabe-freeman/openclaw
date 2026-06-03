@@ -1,29 +1,44 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { OpenClawConfig } from "../config/config.js";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type {
-  ExecSecretProviderConfig,
   FileSecretProviderConfig,
+  ManualExecSecretProviderConfig,
   SecretProviderConfig,
   SecretRef,
   SecretRefSource,
 } from "../config/types.secrets.js";
+import { formatErrorMessage } from "../infra/errors.js";
+import { FsSafeError, readSecureFile } from "../infra/fs-safe.js";
+import { getCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata-snapshot.js";
+import {
+  loadPluginManifestRegistry,
+  type PluginManifestRegistry,
+} from "../plugins/manifest-registry.js";
 import { inspectPathPermissions, safeStat } from "../security/audit-fs.js";
 import { isPathInside } from "../security/scan-paths.js";
 import { resolveUserPath } from "../utils.js";
 import { runTasksWithConcurrency } from "../utils/run-with-concurrency.js";
 import { readJsonPointer } from "./json-pointer.js";
 import {
+  isPluginIntegrationSecretProviderConfig,
+  resolveSecretProviderIntegrationConfig,
+} from "./provider-integrations.js";
+import {
+  formatExecSecretRefIdValidationMessage,
+  isValidExecSecretRefId,
   SINGLE_VALUE_FILE_REF_ID,
   resolveDefaultSecretProviderAlias,
   secretRefKey,
 } from "./ref-contract.js";
+import type { SecretRefResolveCache } from "./resolve-types.js";
 import {
-  describeUnknownError,
   isNonEmptyString,
   isRecord,
   normalizePositiveInt,
+  normalizePositiveTimerMs,
 } from "./shared.js";
 
 const DEFAULT_PROVIDER_CONCURRENCY = 4;
@@ -36,15 +51,13 @@ const DEFAULT_EXEC_MAX_OUTPUT_BYTES = 1024 * 1024;
 const WINDOWS_ABS_PATH_PATTERN = /^[A-Za-z]:[\\/]/;
 const WINDOWS_UNC_PATH_PATTERN = /^\\\\[^\\]+\\[^\\]+/;
 
-export type SecretRefResolveCache = {
-  resolvedByRefKey?: Map<string, Promise<unknown>>;
-  filePayloadByProvider?: Map<string, Promise<unknown>>;
-};
+export type { SecretRefResolveCache } from "./resolve-types.js";
 
 type ResolveSecretRefOptions = {
   config: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
   cache?: SecretRefResolveCache;
+  manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
 };
 
 type ResolutionLimits = {
@@ -127,6 +140,33 @@ function refResolutionError(params: {
   return new SecretRefResolutionError(params);
 }
 
+function throwUnknownProviderResolutionError(params: {
+  source: SecretRefSource;
+  provider: string;
+  err: unknown;
+}): never {
+  if (isSecretResolutionError(params.err)) {
+    throw params.err;
+  }
+  throw providerResolutionError({
+    source: params.source,
+    provider: params.provider,
+    message: formatErrorMessage(params.err),
+    cause: params.err,
+  });
+}
+
+async function readFileStatOrThrow(pathname: string, label: string) {
+  const stat = await safeStat(pathname);
+  if (!stat.ok) {
+    throw new Error(`${label} is not readable: ${pathname}`);
+  }
+  if (stat.isDir) {
+    throw new Error(`${label} must be a file: ${pathname}`);
+  }
+  return stat;
+}
+
 function isAbsolutePathname(value: string): boolean {
   return (
     path.isAbsolute(value) ||
@@ -154,7 +194,13 @@ function toProviderKey(source: SecretRefSource, provider: string): string {
   return `${source}:${provider}`;
 }
 
-function resolveConfiguredProvider(ref: SecretRef, config: OpenClawConfig): SecretProviderConfig {
+function resolveConfiguredProvider(params: {
+  ref: SecretRef;
+  config: OpenClawConfig;
+  env: NodeJS.ProcessEnv;
+  manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
+}): SecretProviderConfig {
+  const { ref, config } = params;
   const providerConfig = config.secrets?.providers?.[ref.provider];
   if (!providerConfig) {
     if (ref.source === "env" && ref.provider === resolveDefaultSecretProviderAlias(config, "env")) {
@@ -173,6 +219,34 @@ function resolveConfiguredProvider(ref: SecretRef, config: OpenClawConfig): Secr
       message: `Secret provider "${ref.provider}" has source "${providerConfig.source}" but ref requests "${ref.source}".`,
     });
   }
+  if (isPluginIntegrationSecretProviderConfig(providerConfig)) {
+    const manifestRegistry =
+      params.manifestRegistry ??
+      getCurrentPluginMetadataSnapshot({
+        config,
+        env: params.env,
+        allowWorkspaceScopedSnapshot: true,
+      })?.manifestRegistry ??
+      loadPluginManifestRegistry({
+        config,
+        env: params.env,
+      });
+    const resolved = resolveSecretProviderIntegrationConfig({
+      manifestRegistry,
+      providerAlias: ref.provider,
+      providerConfig,
+      config,
+      env: params.env,
+    });
+    if (!resolved.ok) {
+      throw providerResolutionError({
+        source: ref.source,
+        provider: ref.provider,
+        message: `Secret provider "${ref.provider}" plugin integration is unavailable: ${resolved.reason}.`,
+      });
+    }
+    return resolved.providerConfig;
+  }
   return providerConfig;
 }
 
@@ -189,13 +263,7 @@ async function assertSecurePath(params: {
   }
 
   let effectivePath = params.targetPath;
-  let stat = await safeStat(effectivePath);
-  if (!stat.ok) {
-    throw new Error(`${params.label} is not readable: ${effectivePath}`);
-  }
-  if (stat.isDir) {
-    throw new Error(`${params.label} must be a file: ${effectivePath}`);
-  }
+  let stat = await readFileStatOrThrow(effectivePath, params.label);
   if (stat.isSymlink) {
     if (!params.allowSymlinkPath) {
       throw new Error(`${params.label} must not be a symlink: ${effectivePath}`);
@@ -208,13 +276,7 @@ async function assertSecurePath(params: {
     if (!isAbsolutePathname(effectivePath)) {
       throw new Error(`${params.label} resolved symlink target must be an absolute path.`);
     }
-    stat = await safeStat(effectivePath);
-    if (!stat.ok) {
-      throw new Error(`${params.label} is not readable: ${effectivePath}`);
-    }
-    if (stat.isDir) {
-      throw new Error(`${params.label} must be a file: ${effectivePath}`);
-    }
+    stat = await readFileStatOrThrow(effectivePath, params.label);
     if (stat.isSymlink) {
       throw new Error(`${params.label} symlink target must not be a symlink: ${effectivePath}`);
     }
@@ -265,39 +327,26 @@ async function readFileProviderPayload(params: {
 }): Promise<unknown> {
   const cacheKey = params.providerName;
   const cache = params.cache;
-  if (cache?.filePayloadByProvider?.has(cacheKey)) {
-    return await (cache.filePayloadByProvider.get(cacheKey) as Promise<unknown>);
+  const cachedFilePayload = cache?.filePayloadByProvider?.get(cacheKey);
+  if (cachedFilePayload) {
+    return await cachedFilePayload;
   }
 
   const filePath = resolveUserPath(params.providerConfig.path);
   const readPromise = (async () => {
-    const secureFilePath = await assertSecurePath({
-      targetPath: filePath,
-      label: `secrets.providers.${params.providerName}.path`,
-    });
-    const timeoutMs = normalizePositiveInt(
+    const timeoutMs = normalizePositiveTimerMs(
       params.providerConfig.timeoutMs,
       DEFAULT_FILE_TIMEOUT_MS,
     );
     const maxBytes = normalizePositiveInt(params.providerConfig.maxBytes, DEFAULT_FILE_MAX_BYTES);
-    const abortController = new AbortController();
-    const timeoutErrorMessage = `File provider "${params.providerName}" timed out after ${timeoutMs}ms.`;
-    let timeoutHandle: NodeJS.Timeout | null = null;
-    const timeoutPromise = new Promise<never>((_resolve, reject) => {
-      timeoutHandle = setTimeout(() => {
-        abortController.abort();
-        reject(new Error(timeoutErrorMessage));
-      }, timeoutMs);
-    });
     try {
-      const payload = await Promise.race([
-        fs.readFile(secureFilePath, { signal: abortController.signal }),
-        timeoutPromise,
-      ]);
-      if (payload.byteLength > maxBytes) {
-        throw new Error(`File provider "${params.providerName}" exceeded maxBytes (${maxBytes}).`);
-      }
-      const text = payload.toString("utf8");
+      const { buffer: payload } = await readSecureFile({
+        filePath,
+        label: `secrets.providers.${params.providerName}.path`,
+        io: { maxBytes, timeoutMs },
+        permissions: { allowInsecure: params.providerConfig.allowInsecurePath },
+      });
+      const text = payload.toString("utf8").replace(/^\uFEFF/, "");
       if (params.providerConfig.mode === "singleValue") {
         return text.replace(/\r?\n$/, "");
       }
@@ -307,14 +356,12 @@ async function readFileProviderPayload(params: {
       }
       return parsed;
     } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") {
-        throw new Error(timeoutErrorMessage, { cause: error });
+      if (error instanceof FsSafeError && error.code === "timeout") {
+        throw new Error(`File provider "${params.providerName}" timed out after ${timeoutMs}ms.`, {
+          cause: error,
+        });
       }
       throw error;
-    } finally {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
-      }
     }
   })();
 
@@ -372,14 +419,10 @@ async function resolveFileRefs(params: {
       cache: params.cache,
     });
   } catch (err) {
-    if (isSecretResolutionError(err)) {
-      throw err;
-    }
-    throw providerResolutionError({
+    throwUnknownProviderResolutionError({
       source: "file",
       provider: params.providerName,
-      message: describeUnknownError(err),
-      cause: err,
+      err,
     });
   }
   const mode = params.providerConfig.mode ?? "json";
@@ -406,7 +449,7 @@ async function resolveFileRefs(params: {
         source: "file",
         provider: params.providerName,
         refId: ref.id,
-        message: describeUnknownError(err),
+        message: formatErrorMessage(err),
         cause: err,
       });
     }
@@ -639,11 +682,11 @@ function parseExecValues(params: {
 async function resolveExecRefs(params: {
   refs: SecretRef[];
   providerName: string;
-  providerConfig: ExecSecretProviderConfig;
+  providerConfig: ManualExecSecretProviderConfig;
   env: NodeJS.ProcessEnv;
   limits: ResolutionLimits;
 }): Promise<ProviderResolutionOutput> {
-  const ids = [...new Set(params.refs.map((ref) => ref.id))];
+  const ids = uniqueStrings(params.refs.map((ref) => ref.id));
   if (ids.length > params.limits.maxRefsPerProvider) {
     throw providerResolutionError({
       source: "exec",
@@ -664,14 +707,10 @@ async function resolveExecRefs(params: {
       allowSymlinkPath: params.providerConfig.allowSymlinkCommand,
     });
   } catch (err) {
-    if (isSecretResolutionError(err)) {
-      throw err;
-    }
-    throw providerResolutionError({
+    throwUnknownProviderResolutionError({
       source: "exec",
       provider: params.providerName,
-      message: describeUnknownError(err),
-      cause: err,
+      err,
     });
   }
 
@@ -700,8 +739,11 @@ async function resolveExecRefs(params: {
     childEnv[key] = value;
   }
 
-  const timeoutMs = normalizePositiveInt(params.providerConfig.timeoutMs, DEFAULT_EXEC_TIMEOUT_MS);
-  const noOutputTimeoutMs = normalizePositiveInt(
+  const timeoutMs = normalizePositiveTimerMs(
+    params.providerConfig.timeoutMs,
+    DEFAULT_EXEC_TIMEOUT_MS,
+  );
+  const noOutputTimeoutMs = normalizePositiveTimerMs(
     params.providerConfig.noOutputTimeoutMs,
     timeoutMs,
   );
@@ -724,14 +766,10 @@ async function resolveExecRefs(params: {
       maxOutputBytes,
     });
   } catch (err) {
-    if (isSecretResolutionError(err)) {
-      throw err;
-    }
-    throw providerResolutionError({
+    throwUnknownProviderResolutionError({
       source: "exec",
       provider: params.providerName,
-      message: describeUnknownError(err),
-      cause: err,
+      err,
     });
   }
   if (result.termination === "timeout") {
@@ -765,14 +803,10 @@ async function resolveExecRefs(params: {
       jsonOnly,
     });
   } catch (err) {
-    if (isSecretResolutionError(err)) {
-      throw err;
-    }
-    throw providerResolutionError({
+    throwUnknownProviderResolutionError({
       source: "exec",
       provider: params.providerName,
-      message: describeUnknownError(err),
-      cause: err,
+      err,
     });
   }
   const resolved = new Map<string, unknown>();
@@ -808,6 +842,13 @@ async function resolveProviderRefs(params: {
       });
     }
     if (params.providerConfig.source === "exec") {
+      if (isPluginIntegrationSecretProviderConfig(params.providerConfig)) {
+        throw providerResolutionError({
+          source: params.source,
+          provider: params.providerName,
+          message: `Secret provider "${params.providerName}" plugin integration was not materialized before exec resolution.`,
+        });
+      }
       return await resolveExecRefs({
         refs: params.refs,
         providerName: params.providerName,
@@ -822,14 +863,10 @@ async function resolveProviderRefs(params: {
       message: `Unsupported secret provider source "${String((params.providerConfig as { source?: unknown }).source)}".`,
     });
   } catch (err) {
-    if (isSecretResolutionError(err)) {
-      throw err;
-    }
-    throw providerResolutionError({
+    return throwUnknownProviderResolutionError({
       source: params.source,
       provider: params.providerName,
-      message: describeUnknownError(err),
-      cause: err,
+      err,
     });
   }
 }
@@ -847,6 +884,11 @@ export async function resolveSecretRefValues(
     const id = ref.id.trim();
     if (!id) {
       throw new Error("Secret reference id is empty.");
+    }
+    if (ref.source === "exec" && !isValidExecSecretRefId(id)) {
+      throw new Error(
+        `${formatExecSecretRefIdValidationMessage()} (ref: ${ref.source}:${ref.provider}:${id}).`,
+      );
     }
     uniqueRefs.set(secretRefKey(ref), { ...ref, id });
   }
@@ -874,7 +916,12 @@ export async function resolveSecretRefValues(
           message: `Secret provider "${group.providerName}" exceeded maxRefsPerProvider (${limits.maxRefsPerProvider}).`,
         });
       }
-      const providerConfig = resolveConfiguredProvider(group.refs[0], options.config);
+      const providerConfig = resolveConfiguredProvider({
+        ref: group.refs[0],
+        config: options.config,
+        env: options.env ?? process.env,
+        manifestRegistry: options.manifestRegistry,
+      });
       const values = await resolveProviderRefs({
         refs: group.refs,
         source: group.source,
@@ -919,8 +966,9 @@ export async function resolveSecretRefValue(
 ): Promise<unknown> {
   const cache = options.cache;
   const key = secretRefKey(ref);
-  if (cache?.resolvedByRefKey?.has(key)) {
-    return await (cache.resolvedByRefKey.get(key) as Promise<unknown>);
+  const cachedResolvedValue = cache?.resolvedByRefKey?.get(key);
+  if (cachedResolvedValue) {
+    return await cachedResolvedValue;
   }
 
   const promise = (async () => {
